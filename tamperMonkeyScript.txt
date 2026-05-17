@@ -1,0 +1,609 @@
+// ==UserScript==
+// @name         FAB Free Asset Library Queue
+// @namespace    https://fab.com/
+// @version      4.0
+// @description  Queues visible free Fab assets and adds them to your Fab library one at a time.
+// @match        https://www.fab.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const STATE = {
+    queue: [],
+    seen: new Set(),
+    queued: new Set(),
+    acquired: new Set(),
+    scanning: false,
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function log(...args) {
+    console.log("[FAB Library Queue]", ...args);
+    const box = document.querySelector("#fab-checkout-queue-log");
+    if (box) box.textContent = args.map(String).join(" ") + "\n" + box.textContent;
+  }
+
+  function injectPanel() {
+    if (document.querySelector("#fab-checkout-queue-panel")) return;
+
+    const style = document.createElement("style");
+    style.textContent = `
+      #fab-checkout-queue-panel {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        z-index: 999999;
+        background: #18181c;
+        color: white;
+        border: 1px solid #444;
+        border-radius: 12px;
+        padding: 12px;
+        width: 340px;
+        font-family: system-ui, sans-serif;
+        box-shadow: 0 8px 30px rgba(0,0,0,.45);
+      }
+      #fab-checkout-queue-panel button {
+        width: 100%;
+        margin-top: 8px;
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid #666;
+        background: #2b6cff;
+        color: white;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      #fab-checkout-queue-panel button.secondary {
+        background: #333;
+      }
+      #fab-checkout-queue-log {
+        white-space: pre-wrap;
+        max-height: 220px;
+        overflow: auto;
+        font-size: 12px;
+        margin-top: 8px;
+        color: #ccc;
+      }
+      .fab-library-queue-hidden {
+        display: none !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    const panel = document.createElement("div");
+    panel.id = "fab-checkout-queue-panel";
+    panel.innerHTML = `
+      <strong>FAB Library Queue</strong>
+      <button id="fab-scan-visible">Scan visible free assets</button>
+      <button id="fab-auto-scroll" class="secondary">Auto-scroll + scan</button>
+      <button id="fab-add-next">Add next to library</button>
+      <button id="fab-add-all" class="secondary">Add queued to library</button>
+      <div id="fab-checkout-queue-log">Ready.</div>
+    `;
+    document.body.appendChild(panel);
+
+    document.querySelector("#fab-scan-visible").addEventListener("click", scanVisible);
+    document.querySelector("#fab-auto-scroll").addEventListener("click", autoScrollScan);
+    document.querySelector("#fab-add-next").addEventListener("click", addNextToLibrary);
+    document.querySelector("#fab-add-all").addEventListener("click", addQueuedToLibrary);
+  }
+
+  function getCSRFToken() {
+    for (const name of ["csrftoken", "fab_csrftoken", "csrf_token"]) {
+      const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+      if (match) return decodeURIComponent(match[1]);
+    }
+
+    return document.querySelector('meta[name="csrf-token"]')?.content || "";
+  }
+
+  function fabHeaders() {
+    const headers = {
+      Accept: "application/json, text/plain, */*",
+      "X-Requested-With": "XMLHttpRequest",
+    };
+
+    const csrf = getCSRFToken();
+    if (csrf) headers["X-CSRFToken"] = csrf;
+
+    return headers;
+  }
+
+  async function fetchJson(url, options = {}) {
+    const response = await fetch(url, {
+      credentials: "include",
+      headers: fabHeaders(),
+      ...options,
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 200)}`);
+    }
+
+    return text ? JSON.parse(text) : null;
+  }
+
+  async function postJson(url, data) {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        ...fabHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(data),
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 200)}`);
+    }
+
+    return text ? JSON.parse(text) : null;
+  }
+
+  function extractListingIdsFromPage() {
+    const links = [...document.querySelectorAll('a[href*="/listings/"]')];
+
+    return [...new Set(
+      links
+        .map((a) => {
+          const match = a.href.match(/\/listings\/([a-zA-Z0-9-]+)/);
+          return match ? match[1] : null;
+        })
+        .filter(Boolean)
+    )];
+  }
+
+  function findListingElements(listingId) {
+    return [...document.querySelectorAll(`a[href*="/listings/${listingId}"]`)]
+      .map((link) => {
+        return (
+          link.closest("article") ||
+          link.closest("li") ||
+          link.closest('[data-testid*="listing"]') ||
+          link.closest('[class*="Card"]') ||
+          link.parentElement
+        );
+      })
+      .filter(Boolean);
+  }
+
+  function hideListing(listingId) {
+    for (const element of findListingElements(listingId)) {
+      element.classList.add("fab-library-queue-hidden");
+    }
+  }
+
+  function normalizeOfferId(offerId) {
+    if (!offerId) return null;
+    if (typeof offerId === "string") return offerId;
+
+    if (typeof offerId === "object") {
+      return offerId.id || offerId.uid || offerId.offerId || offerId.offer_id || offerId.value || null;
+    }
+
+    return null;
+  }
+
+  function hasFreePrice(value) {
+    if (!value || typeof value !== "object") return false;
+
+    if (value.isFree === true || value.free === true) return true;
+
+    for (const key of ["price", "amount", "amountInCents", "discountedPrice", "discountedAmount"]) {
+      const child = value[key];
+      if (child === 0 || child === "0" || child === "0.00") return true;
+      if (child && typeof child === "object" && hasFreePrice(child)) return true;
+    }
+
+    if (value.priceTier && hasFreePrice(value.priceTier)) return true;
+    if (value.priceValue && hasFreePrice(value.priceValue)) return true;
+
+    return false;
+  }
+
+  function hasDirectFreeSignal(value) {
+    if (!value || typeof value !== "object") return false;
+    if (value.isFree === true || value.free === true) return true;
+
+    for (const key of ["price", "amount", "amountInCents", "discountedPrice", "discountedAmount"]) {
+      const child = value[key];
+      if (child === 0 || child === "0" || child === "0.00") return true;
+      if (
+        child &&
+        typeof child === "object" &&
+        (child.amount === 0 ||
+          child.amount === "0" ||
+          child.price === 0 ||
+          child.price === "0" ||
+          child.value === 0 ||
+          child.value === "0")
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isProfessionalLicense(value) {
+    const label = [
+      value?.name,
+      value?.slug,
+      value?.path,
+      value?.license,
+      value?.licenseName,
+      value?.licenseType,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+    return label.includes("professional") || label.includes("pro");
+  }
+
+  function licenseLabel(value) {
+    return value?.name || value?.slug || value?.licenseName || value?.licenseType || "free license";
+  }
+
+  function offerLabel(value, inheritedLabel) {
+    const label = licenseLabel(value);
+    return label === "free license" ? inheritedLabel || label : label;
+  }
+
+  function collectOfferCandidates(value, out = [], context = {}) {
+    if (!value || typeof value !== "object") return out;
+
+    const label = offerLabel(value, context.label);
+    const professional = context.professional || isProfessionalLicense(value);
+    const free = hasDirectFreeSignal(value) || hasFreePrice(value?.priceTier) || hasFreePrice(value?.priceValue);
+
+    const offerId =
+      normalizeOfferId(value.offerId) ||
+      normalizeOfferId(value.offer_id) ||
+      normalizeOfferId(value.offer);
+
+    if (offerId) {
+      out.push({
+        offerId,
+        label,
+        professional,
+        free,
+        promotionRequestId: value.promotionRequestId || context.promotionRequestId || "",
+      });
+    }
+
+    const nextContext = {
+      label,
+      professional,
+      promotionRequestId: value.promotionRequestId || context.promotionRequestId || "",
+    };
+
+    for (const child of Object.values(value)) {
+      if (Array.isArray(child)) {
+        child.forEach((item) => collectOfferCandidates(item, out, nextContext));
+      } else if (child && typeof child === "object") {
+        collectOfferCandidates(child, out, nextContext);
+      }
+    }
+
+    return out;
+  }
+
+  function rankOfferCandidates(json) {
+    const byId = new Map();
+
+    for (const offer of collectOfferCandidates(json)) {
+      const label = offer.label || "free license";
+      const lowerLabel = label.toLowerCase();
+      const score =
+        (offer.free ? 100 : 0) +
+        (!offer.professional ? 20 : -50) +
+        (lowerLabel.includes("personal") ? 10 : 0) +
+        (lowerLabel.includes("reference-plus-source") ? 5 : 0);
+
+      const candidate = {
+        ...offer,
+        label,
+        score,
+      };
+
+      const existing = byId.get(candidate.offerId);
+      if (!existing || candidate.score > existing.score) {
+        byId.set(candidate.offerId, candidate);
+      }
+    }
+
+    return [...byId.values()].sort((a, b) => b.score - a.score);
+  }
+
+  function findObjectsWithOfferIds(value, path = "$", out = []) {
+    if (!value || typeof value !== "object") return out;
+
+    const offerId =
+      normalizeOfferId(value.offerId) ||
+      normalizeOfferId(value.offer_id) ||
+      normalizeOfferId(value.offer);
+
+    if (offerId) {
+      out.push({
+        path,
+        offerId,
+        name: value.name || value.slug || value.licenseName || value.licenseType || value.title || "",
+        keys: Object.keys(value).slice(0, 20),
+        price: value.price ?? value.amount ?? value.discountedPrice ?? value.priceTier ?? value.priceValue ?? null,
+        free: hasDirectFreeSignal(value) || hasFreePrice(value?.priceTier) || hasFreePrice(value?.priceValue),
+        professional: isProfessionalLicense(value),
+      });
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (Array.isArray(child)) {
+        child.forEach((item, index) => findObjectsWithOfferIds(item, `${path}.${key}[${index}]`, out));
+      } else if (child && typeof child === "object") {
+        findObjectsWithOfferIds(child, `${path}.${key}`, out);
+      }
+    }
+
+    return out;
+  }
+
+  async function getListingInfo(listingId) {
+    const json = await fetchJson(`/i/listings/${listingId}`);
+
+    const name = json.title || json.name || listingId;
+    const licenses = Array.isArray(json.licenses) ? json.licenses : [];
+
+    const freeLicense = licenses.find((license) => {
+      return hasFreePrice(license) && normalizeOfferId(license?.offerId) && !isProfessionalLicense(license);
+    });
+
+    const offerCandidates = rankOfferCandidates(json);
+    const selectedOffer = freeLicense
+      ? {
+          offerId: normalizeOfferId(freeLicense.offerId),
+          label: licenseLabel(freeLicense),
+          professional: false,
+          free: true,
+          score: 130,
+          promotionRequestId: json.promotionRequestId || "",
+        }
+      : offerCandidates.find((offer) => offer.free && !offer.professional) ||
+        offerCandidates.find((offer) => !offer.professional) ||
+        offerCandidates[0] ||
+        null;
+
+    const candidates = selectedOffer
+      ? [selectedOffer, ...offerCandidates.filter((offer) => offer.offerId !== selectedOffer.offerId)]
+      : offerCandidates;
+
+    return {
+      listingId,
+      name,
+      offerId: selectedOffer?.offerId || null,
+      license: selectedOffer?.label || "",
+      promotionRequestId: selectedOffer?.promotionRequestId || json.promotionRequestId || "",
+      offerCandidates: candidates,
+      debugOffers: findObjectsWithOfferIds(json),
+      listingUrl: `https://www.fab.com/listings/${listingId}`,
+    };
+  }
+
+  async function scanVisible() {
+    if (STATE.scanning) {
+      log("Already scanning.");
+      return;
+    }
+
+    STATE.scanning = true;
+
+    try {
+      const ids = extractListingIdsFromPage().filter((id) => !STATE.seen.has(id));
+      ids.forEach((id) => STATE.seen.add(id));
+
+      log(`Found ${ids.length} new visible listing IDs.`);
+
+      for (const id of ids) {
+        try {
+          const state = await getListingState(id);
+          if (isAcquiredState(state)) {
+            STATE.acquired.add(id);
+            STATE.queued.delete(id);
+            hideListing(id);
+            log(`Hidden, already in library: ${id}`);
+            await sleep(250);
+            continue;
+          }
+
+          const info = await getListingInfo(id);
+
+          if (!info.offerId) {
+            log(`Skipped, no free offer: ${info.name}`);
+            continue;
+          }
+
+          if (STATE.queued.has(id)) {
+            continue;
+          }
+
+          STATE.queue.push(info);
+          STATE.queued.add(id);
+          log(`Queued: ${info.name}${info.license ? ` (${info.license})` : ""}`);
+        } catch (err) {
+          log(`Failed listing ${id}: ${err.message}`);
+        }
+
+        await sleep(600);
+      }
+
+      log(`Queue size: ${STATE.queue.length}`);
+    } finally {
+      STATE.scanning = false;
+    }
+  }
+
+  async function autoScrollScan() {
+    if (STATE.scanning) {
+      log("Already scanning.");
+      return;
+    }
+
+    for (let i = 0; i < 20; i++) {
+      log(`Scan pass ${i + 1}/20`);
+      await scanVisible();
+
+      window.scrollTo({
+        top: document.body.scrollHeight,
+        behavior: "smooth",
+      });
+
+      await sleep(4000);
+    }
+
+    log(`Auto-scroll scan complete. Queue size: ${STATE.queue.length}`);
+    if (STATE.queue.length) {
+      log("Adding queued assets.");
+      await addQueuedToLibrary();
+    }
+  }
+
+  async function getListingState(listingId) {
+    return fetchJson(`/i/users/me/listings-states/${listingId}?`);
+  }
+
+  function isAcquiredState(state) {
+    if (Array.isArray(state)) return state.some((item) => item?.acquired === true);
+    return state?.acquired === true;
+  }
+
+  async function runZeroPriceCheckout(item, candidate) {
+    log(`Trying zero-price checkout: ${candidate.label || "unknown license"} (${candidate.offerId})`);
+
+    await postJson("/i/payment", { offer_ids: [candidate.offerId] });
+    await postJson("/i/payment/finalize", { offer_ids: [candidate.offerId] });
+    await sleep(800);
+
+    item.offerId = candidate.offerId;
+    item.license = candidate.label || item.license;
+
+    return isAcquiredState(await getListingState(item.listingId))
+      ? { status: "added", method: "checkout" }
+      : { status: "submitted", method: "checkout" };
+  }
+
+  async function addToLibrary(item) {
+    if (isAcquiredState(await getListingState(item.listingId))) {
+      return { status: "already" };
+    }
+
+    const candidates = item.offerCandidates?.length
+      ? item.offerCandidates
+      : [{ offerId: item.offerId, label: item.license }];
+
+    const errors = [];
+
+    for (const candidate of candidates) {
+      if (!candidate.offerId) continue;
+
+      const body = new FormData();
+      body.append("offer_id", candidate.offerId);
+      if (candidate.promotionRequestId || item.promotionRequestId) {
+        body.append("promotion_request_id", candidate.promotionRequestId || item.promotionRequestId);
+        body.append("promotionRequestId", candidate.promotionRequestId || item.promotionRequestId);
+      }
+
+      log(`Trying offer: ${candidate.label || "unknown license"} (${candidate.offerId})`);
+
+      const response = await fetch(`/i/listings/${item.listingId}/add-to-library`, {
+        method: "POST",
+        credentials: "include",
+        headers: fabHeaders(),
+        body,
+      });
+
+      if (response.status === 204) {
+        item.offerId = candidate.offerId;
+        item.license = candidate.label || item.license;
+        return isAcquiredState(await getListingState(item.listingId))
+          ? { status: "added", method: "library" }
+          : { status: "submitted", method: "library" };
+      }
+
+      const text = await response.text();
+      errors.push(`${candidate.label || candidate.offerId}: ${response.status} ${text.slice(0, 120)}`);
+
+      if (text.includes("Not free") && candidate.free) {
+        const result = await runZeroPriceCheckout(item, candidate);
+        if (result.status === "added") return result;
+        errors.push(`${candidate.label || candidate.offerId}: checkout completed but listing state is not acquired`);
+        continue;
+      }
+
+      if (!text.includes("Not free")) break;
+    }
+
+    console.warn("[FAB Library Queue] Offer debug for failed listing", item.name, {
+      listingId: item.listingId,
+      candidates,
+      discoveredOffers: item.debugOffers,
+    });
+
+    throw new Error(errors.join(" | "));
+  }
+
+  async function addNextToLibrary() {
+    if (!STATE.queue.length) {
+      log("Queue is empty. Scan first.");
+      return;
+    }
+
+    const item = STATE.queue.shift();
+    STATE.queued.delete(item.listingId);
+
+    try {
+      log(`Adding: ${item.name}${item.license ? ` (${item.license})` : ""}`);
+      const result = await addToLibrary(item);
+      if (result.status === "already") {
+        STATE.acquired.add(item.listingId);
+        hideListing(item.listingId);
+        log(`Already in library: ${item.name}`);
+      } else if (result.status === "added") {
+        STATE.acquired.add(item.listingId);
+        hideListing(item.listingId);
+        log(`Added via ${result.method}: ${item.name}`);
+      } else {
+        log(`Submitted via ${result.method || "unknown"}: ${item.name}`);
+      }
+    } catch (err) {
+      log(`Failed add: ${item.name}: ${err.message}`);
+      STATE.queue.unshift(item);
+      STATE.queued.add(item.listingId);
+    }
+
+    log(`Remaining queue: ${STATE.queue.length}`);
+  }
+
+  async function addQueuedToLibrary() {
+    while (STATE.queue.length) {
+      const before = STATE.queue.length;
+      await addNextToLibrary();
+      if (STATE.queue.length === before) break;
+      await sleep(1200);
+    }
+  }
+
+  injectPanel();
+
+  const observer = new MutationObserver(injectPanel);
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  log("Loaded. Scan assets, then add them to your library.");
+})();
